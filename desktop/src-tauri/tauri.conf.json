@@ -1,0 +1,37 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "__APP_NAME__",
+  "mainBinaryName": "__APP_NAME__",
+  "version": "1.0.0",
+  "identifier": "__APP_IDENTIFIER__",
+  "build": {
+    "beforeDevCommand": "pnpm --dir ../app dev",
+    "devUrl": "http://127.0.0.1:__APP_PORT_DEV__",
+    "frontendDist": "../launcher"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app"],
+    "externalBin": ["binaries/node"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "entitlements": "entitlements.plist",
+      "hardenedRuntime": true,
+      "minimumSystemVersion": "11.0",
+      "bundleName": "__APP_NAME__"
+    }
+  }
+}

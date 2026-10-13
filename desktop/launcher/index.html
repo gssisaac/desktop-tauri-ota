@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>__APP_NAME__</title>
+    <style>
+      :root {
+        --bg: #fafafa;
+        --fg: #18181b;
+        --muted: #71717a;
+        --track: #e4e4e7;
+        --bar: #18181b;
+        --panel: #f4f4f5;
+        --danger: #b91c1c;
+        color-scheme: light dark;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0a0a0b;
+          --fg: #fafafa;
+          --muted: #a1a1aa;
+          --track: #27272a;
+          --bar: #fafafa;
+          --panel: #18181b;
+          --danger: #f87171;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        background: var(--bg);
+        color: var(--fg);
+        font: 14px/1.5 system-ui, -apple-system, sans-serif;
+        display: grid;
+        place-items: center;
+        padding: 48px 24px 24px;
+        user-select: none;
+        -webkit-user-select: none;
+        cursor: default;
+      }
+      .drag {
+        position: fixed;
+        inset: 0 0 auto 0;
+        height: 40px;
+      }
+      main {
+        width: min(420px, 100%);
+        text-align: center;
+      }
+      img {
+        width: 72px;
+        height: 72px;
+        border-radius: 16px;
+      }
+      h1 {
+        margin: 16px 0 4px;
+        font-size: 18px;
+        font-weight: 600;
+      }
+      #message {
+        margin: 0;
+        min-height: 21px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .track {
+        position: relative;
+        overflow: hidden;
+        width: 240px;
+        height: 4px;
+        margin: 20px auto 0;
+        border-radius: 2px;
+        background: var(--track);
+      }
+      .bar {
+        position: absolute;
+        inset: 0 auto 0 0;
+        width: 0;
+        border-radius: 2px;
+        background: var(--bar);
+        transition: width 120ms linear;
+      }
+      .track.indeterminate .bar {
+        width: 35%;
+        transition: none;
+        animation: slide 1.1s ease-in-out infinite;
+      }
+      @keyframes slide {
+        from {
+          transform: translateX(-100%);
+        }
+        to {
+          transform: translateX(290%);
+        }
+      }
+      #error {
+        margin-top: 20px;
+        text-align: left;
+      }
+      #error[hidden],
+      .track[hidden] {
+        display: none;
+      }
+      pre {
+        max-height: 220px;
+        overflow: auto;
+        margin: 0 0 16px;
+        padding: 12px;
+        border-radius: 8px;
+        background: var(--panel);
+        color: var(--danger);
+        font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+        white-space: pre-wrap;
+        word-break: break-word;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      button {
+        display: block;
+        margin: 0 auto;
+        padding: 7px 18px;
+        border: 0;
+        border-radius: 6px;
+        background: var(--fg);
+        color: var(--bg);
+        font: inherit;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="drag" data-tauri-drag-region></div>
+    <main>
+      <img src="icon.png" alt="" />
+      <h1>__APP_NAME__</h1>
+      <p id="message">Starting…</p>
+      <div id="track" class="track indeterminate"><div id="bar" class="bar"></div></div>
+      <section id="error" hidden>
+        <pre id="detail"></pre>
+        <button id="retry" type="button">Retry</button>
+      </section>
+    </main>
+    <script>
+      const { invoke } = window.__TAURI__.core;
+      const { listen } = window.__TAURI__.event;
+
+      const message = document.getElementById('message');
+      const track = document.getElementById('track');
+      const bar = document.getElementById('bar');
+      const error = document.getElementById('error');
+      const detail = document.getElementById('detail');
+      const retry = document.getElementById('retry');
+
+      let lastSeq = -1;
+
+      function render(status) {
+        if (!status || status.seq <= lastSeq) return;
+        lastSeq = status.seq;
+
+        const failed = status.phase === 'error';
+        if (status.message) message.textContent = status.message;
+        track.hidden = failed;
+        error.hidden = !failed;
+        detail.textContent = status.detail || '';
+        retry.disabled = false;
+
+        const determinate = typeof status.progress === 'number';
+        track.classList.toggle('indeterminate', !determinate);
+        bar.style.width = determinate ? `${Math.round(status.progress * 100)}%` : '';
+      }
+
+      listen('launcher://status', (event) => render(event.payload));
+      invoke('launcher_status').then(render);
+
+      retry.addEventListener('click', () => {
+        retry.disabled = true;
+        invoke('launcher_retry');
+      });
+    </script>
+  </body>
+</html>

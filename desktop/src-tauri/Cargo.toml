@@ -1,0 +1,36 @@
+[package]
+name = "__APP_SLUG_SNAKE__"
+version = "1.0.0"
+description = "__APP_NAME__ desktop application"
+authors = ["__APP_NAME__"]
+edition = "2021"
+rust-version = "1.77.2"
+autobins = false
+
+[[bin]]
+name = "__APP_NAME__"
+path = "src/main.rs"
+
+[lib]
+name = "__APP_SLUG_SNAKE___lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2.11.3", features = ["tray-icon"] }
+tauri-plugin-log = "2"
+tauri-plugin-single-instance = "2"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+sha2 = "0.10"
+hex = "0.4"
+ed25519-dalek = { version = "2", features = ["std"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

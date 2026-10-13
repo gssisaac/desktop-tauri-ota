@@ -1,0 +1,17 @@
+node_modules
+.env
+.env.local
+.ota/
+.ota-staging/
+.desktop-staging/
+.cursor/
+.wrangler/
+desktop/.cursor/
+desktop/src-tauri/.wrangler/
+desktop/src-tauri/target/
+desktop/src-tauri/binaries/
+desktop/node_modules/
+app/node_modules/
+app/.next/
+app/.next-standalone/
+scripts/deploy/apple-signing.env

@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default __APP_NAME__ desktop capabilities",
+  "windows": ["*"],
+  "remote": { "urls": ["http://127.0.0.1:__APP_PORT_PROD__"] },
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
+}

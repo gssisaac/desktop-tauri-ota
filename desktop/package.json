@@ -1,0 +1,17 @@
+{
+  "name": "__APP_SLUG__-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "__APP_NAME__ desktop launcher (Tauri v2 shell for full-stack OTA bundles)",
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "predev": "node ../scripts/prepare-node-sidecar.mjs",
+    "dev": "tauri dev",
+    "prebuild": "node ../scripts/prepare-node-sidecar.mjs",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}
