@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 const root = join(fileURLToPath(import.meta.url), '..', '..');
 const SKIP = new Set(['neutralize-placeholders.mjs', 'Cargo.lock']);
 const TEXT_EXT = new Set([
-  '.rs', '.json', '.html', '.md', '.mjs', '.sh', '.toml', '.plist', '.example', '.gitignore',
+  '.rs', '.json', '.html', '.md', '.mjs', '.tsx', '.sh', '.toml', '.plist', '.example', '.gitignore',
 ]);
 
 const PLACEHOLDER_PUBLIC_KEY =

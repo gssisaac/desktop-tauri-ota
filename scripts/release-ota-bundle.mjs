@@ -8,8 +8,9 @@
  * Run on macOS for manifest.json (universal arm64 + x86_64 bundle), or on Windows x64 for
  * manifest-windows-x64.json (read by the Windows launcher, bundle_manager.rs MANIFEST_URL).
  *
- * Usage: pnpm release:ota <version> [--dry-run]
- * Signing key: auto from .ota/credentials.env (created on first run)
+ * Usage: pnpm release:ota <version> [--dry-run] [--seed-only]
+ * `--seed-only` builds and copies the zip into the desktop installer resources, and does not upload.
+ * Signing key: auto from .ota/credentials.env (created on first run; not required for --seed-only)
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, createPrivateKey, sign } from 'node:crypto';
@@ -38,6 +39,7 @@ import {
 } from './prepare-node-sidecar.mjs';
 import { envVar } from './app-config.mjs';
 import { r2BaseUrl as baseUrl, r2Put } from './r2.mjs';
+import { signMacBundleNativeBinaries } from './sign-mac-binaries.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const isWindows = process.platform === 'win32';
@@ -46,6 +48,7 @@ loadMergedEnvIntoProcess();
 
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');
+const seedOnly = args.includes('--seed-only');
 const version = args.find((arg) => !arg.startsWith('--'));
 if (!version) {
   console.error('Usage: pnpm release:ota <version> [--dry-run]');
@@ -72,14 +75,6 @@ if (process.versions.modules !== NODE_MODULE_VERSION) {
 // actually needs a newer shell. Override with __APP_SLUG_UPPER___MIN_APP_VERSION when that happens.
 const MIN_LAUNCHER_VERSION = '0.1.1';
 const minAppVersion = process.env[envVar('MIN_APP_VERSION')] || MIN_LAUNCHER_VERSION;
-
-let privateKeyHex;
-try {
-  privateKeyHex = ensureOtaPrivateKeyHex();
-} catch (err) {
-  console.error('[release-ota]', err instanceof Error ? err.message : err);
-  process.exit(1);
-}
 
 const appRoot = join(root, 'app');
 // Must match distDir for __APP_SLUG_UPPER___API_STANDALONE in app/next.config.ts.
@@ -331,7 +326,16 @@ try {
   fail(`smoke test failed: ${err instanceof Error ? err.message : err}`);
 }
 
-// 6. Zip. The archive name is the version; a given name is one file.
+// 6. Sign native modules for the DMG seed zip (notarization scans inside bundle.zip).
+if (!isWindows) {
+  try {
+    signMacBundleNativeBinaries(bundleDir);
+  } catch (err) {
+    fail(err instanceof Error ? err.message : err);
+  }
+}
+
+// 7. Zip. The archive name is the version; a given name is one file.
 const tmpZip = join(staging, 'bundle.zip');
 // Windows has no `zip`; its bundled bsdtar writes deflate zips (`-a` picks the format from .zip).
 const zipResult = isWindows
@@ -352,6 +356,32 @@ const zipName = `__APP_SLUG__-${version}${isWindows ? '-win-x64' : ''}.zip`;
 const manifestKey = isWindows ? 'manifest-windows-x64.json' : 'manifest.json';
 const zipPath = join(staging, zipName);
 renameSync(tmpZip, zipPath);
+
+const seedDir = join(root, 'desktop', 'src-tauri', 'resources', 'seed-bundle');
+mkdirSync(seedDir, { recursive: true });
+cpSync(zipPath, join(seedDir, 'bundle.zip'));
+writeFileSync(join(seedDir, 'version'), `${version}\n`);
+console.log(`[release-ota] installer seed v${version} → ${seedDir}`);
+
+if (seedOnly) {
+  const localManifest = {
+    version,
+    minAppVersion,
+    size: zipBytes.length,
+    releaseDate: new Date().toISOString(),
+  };
+  writeFileSync(join(staging, manifestKey), `${JSON.stringify(localManifest, null, 2)}\n`);
+  console.log(`[release-ota] bundle size: ${(zipBytes.length / 1_048_576).toFixed(1)} MB`);
+  console.log('[release-ota] --seed-only: skipping publish');
+  process.exit(0);
+}
+
+let privateKeyHex;
+try {
+  privateKeyHex = ensureOtaPrivateKeyHex();
+} catch (err) {
+  fail(err instanceof Error ? err.message : err);
+}
 
 const seed = Buffer.from(privateKeyHex, 'hex');
 if (seed.length !== 32) fail('the OTA private key must be 32 bytes (64 hex chars)');
@@ -382,7 +412,7 @@ if (dryRun) {
   process.exit(0);
 }
 
-// 7. Upload the bundle before the manifest so clients never see a URL that 404s.
+// 8. Upload the bundle before the manifest so clients never see a URL that 404s.
 if (!r2Put(`bundles/${zipName}`, zipPath, 'application/zip', 'public, max-age=31536000, immutable')) {
   fail('bundle upload failed. Fix auth (.env or wrangler login) and retry.');
 }

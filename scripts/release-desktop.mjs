@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 /**
- * Desktop launcher release: build the signed DMG (launcher + bundled Node.js runtime), enforce
- * the 70 MB size budget, and publish it to Cloudflare R2 under downloads/ plus
+ * Desktop launcher release: build the signed DMG (launcher, bundled Node.js runtime, and the
+ * current app bundle), and publish it to Cloudflare R2 under downloads/ plus
  * downloads/latest.json (read by __APP_DOMAIN__/download and /download/mac).
+ *
+ * The app bundle is staged by `desktop`'s prebuild (`scripts/stage-seed-bundle.mjs`) into
+ * `src-tauri/resources/seed-bundle/` before Tauri packages the DMG.
  *
  * Usage: pnpm release:desktop [--dry-run]
  * Signing: scripts/deploy/apple-signing.env (APPLE_SIGNING_IDENTITY), else the first
@@ -22,16 +25,17 @@ import {
   prepareNodeSidecar,
 } from './prepare-node-sidecar.mjs';
 import { parseEnvFile } from './ota-credentials.mjs';
+import { findBundledSeedVersion } from './stage-seed-bundle.mjs';
 import { r2BaseUrl, r2Put } from './r2.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const dryRun = process.argv.includes('--dry-run');
 
 /**
- * Hard budget for the installer: the whole app ships via OTA, the DMG is only the launcher plus
- * its Node.js runtime (Contents/MacOS/node).
+ * Sanity cap. The DMG carries the launcher, Node, and the current app bundle (a zipped
+ * Next.js standalone), so it is larger than the old launcher-only 70 MB budget.
  */
-const MAX_DMG_BYTES = 70_000_000;
+const MAX_DMG_BYTES = 400_000_000;
 
 const desktopRoot = join(root, 'desktop');
 const tauriConf = JSON.parse(
@@ -144,6 +148,14 @@ const build = spawnSync('pnpm', ['--dir', desktopRoot, 'run', 'build'], {
 if (build.status !== 0) fail('tauri build failed');
 if (!existsSync(dmgPath)) fail(`expected ${dmgPath}`);
 
+const seeded = findBundledSeedVersion([join(appPath, 'Contents', 'Resources'), appPath]);
+if (!seeded) {
+  fail('DMG is missing the seeded app bundle (resources/seed-bundle/version + bundle.zip)');
+}
+console.log(
+  `[release-desktop] installer includes app bundle v${seeded.version} (${(statSync(seeded.zip).size / 1_048_576).toFixed(1)} MB)`,
+);
+
 // Tauri notarizes the .app. The DMG needs its own notarytool submit + staple.
 const notarize = spawnSync('bash', [join(root, 'scripts', 'deploy', 'notarize-dmg.sh')], {
   cwd: root,
@@ -194,6 +206,7 @@ const latest = {
   size,
   sha256,
   notarized,
+  bundleVersion: seeded.version,
   releaseDate: new Date().toISOString(),
 };
 

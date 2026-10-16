@@ -1,10 +1,15 @@
 //! Full-stack OTA bundles: a Next.js standalone server (UI + API) zipped, signed and
 //! published to R2 by `pnpm release:ota`. The launcher installs them under
 //! `~/Library/Application Support/__APP_IDENTIFIER__/bundles/v<version>/`.
+//!
+//! DMG / NSIS builds also embed the latest bundle (`resources/seed-bundle/`). Startup runs
+//! the already installed copy (or that seed, on first launch) immediately, then downloads a
+//! newer release in the background. The new copy stays pending until the user refreshes.
 
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -58,8 +63,22 @@ impl Bundle {
 
 pub enum Progress {
     Checking,
-    Downloading { received: u64, total: Option<u64> },
+    Downloading {
+        received: u64,
+        total: Option<u64>,
+    },
+    /// Unpacking the bundle shipped inside the installer. No network.
+    Preparing {
+        version: String,
+    },
     Installing,
+}
+
+/// Serializes install, activate, and prune. Not held across the network download.
+static BUNDLE_OP: Mutex<()> = Mutex::new(());
+
+fn lock_bundles() -> std::sync::MutexGuard<'static, ()> {
+    BUNDLE_OP.lock().unwrap_or_else(|err| err.into_inner())
 }
 
 pub fn app_data_dir() -> Result<PathBuf, String> {
@@ -78,6 +97,10 @@ fn active_pointer_path() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("active.json"))
 }
 
+fn pending_pointer_path() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join("pending.json"))
+}
+
 fn write_active(version: &str, bundle_dir: &Path) -> Result<(), String> {
     let data_dir = app_data_dir()?;
     fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
@@ -87,6 +110,23 @@ fn write_active(version: &str, bundle_dir: &Path) -> Result<(), String> {
     };
     let json = serde_json::to_string_pretty(&ptr).map_err(|e| e.to_string())? + "\n";
     fs::write(active_pointer_path()?, json).map_err(|e| e.to_string())
+}
+
+fn write_pending(version: &str, bundle_dir: &Path) -> Result<(), String> {
+    let data_dir = app_data_dir()?;
+    fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
+    let ptr = ActivePointer {
+        version: version.to_string(),
+        path: bundle_dir.display().to_string(),
+    };
+    let json = serde_json::to_string_pretty(&ptr).map_err(|e| e.to_string())? + "\n";
+    fs::write(pending_pointer_path()?, json).map_err(|e| e.to_string())
+}
+
+fn clear_pending() {
+    if let Ok(path) = pending_pointer_path() {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// The manifest is unsigned, so its version must not be able to escape `bundles/`.
@@ -115,7 +155,10 @@ fn version_lt(a: &str, b: &str) -> bool {
     }
     let (a, b) = (parts(a), parts(b));
     for i in 0..a.len().max(b.len()) {
-        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
         if x != y {
             return x < y;
         }
@@ -205,14 +248,12 @@ fn extract_zip_secure(zip_bytes: &[u8], dest: &Path) -> Result<(), String> {
 
     let cursor = std::io::Cursor::new(zip_bytes);
     let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("zip open: {e}"))?;
-    let dest_canon = dest
-        .canonicalize()
-        .unwrap_or_else(|_| dest.to_path_buf());
+    let dest_canon = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| format!("zip entry: {e}"))?;
-        let name = file.name().to_string();
-        let rel = Path::new(&name);
+        let name = file.name().map_err(|e| format!("zip entry name: {e}"))?;
+        let rel = Path::new(name.as_ref());
         if rel.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(format!("zip slip rejected: {name}"));
         }
@@ -228,25 +269,47 @@ fn extract_zip_secure(zip_bytes: &[u8], dest: &Path) -> Result<(), String> {
             }
             let mut out = fs::File::create(&out_path).map_err(|e| format!("create file: {e}"))?;
             std::io::copy(&mut file, &mut out).map_err(|e| format!("extract file: {e}"))?;
+            // `zip -X` strips Unix modes. node-pty's spawn-helper must be executable.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut mode = file.unix_mode().unwrap_or(0o644);
+                if out_path.file_name().and_then(|n| n.to_str()) == Some("spawn-helper") {
+                    mode |= 0o755;
+                }
+                fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))
+                    .map_err(|e| format!("chmod {}: {e}", out_path.display()))?;
+            }
         }
     }
     Ok(())
 }
 
-fn install_manifest(
-    manifest: &OtaManifest,
+/// Unpack a verified zip into `bundles/v{version}`. `make_active` switches the running
+/// pointer; otherwise the install stays in `pending.json` until the user refreshes.
+fn install_zip(
+    version: &str,
+    zip_bytes: &[u8],
+    make_active: bool,
     on_progress: &dyn Fn(Progress),
 ) -> Result<Bundle, String> {
-    let version_path = version_dir(&manifest.version)?;
-    let zip_bytes = download_bytes(&manifest.url, manifest.size, on_progress)?;
-    on_progress(Progress::Installing);
-    crypto::verify_bundle(&zip_bytes, &manifest.sha256, &manifest.signature)?;
+    validate_version(version)?;
+    let version_path = version_dir(version)?;
+    if let Some(active) = active_bundle() {
+        if active.version == version && active.dir.join(SERVER_ENTRY).is_file() {
+            return Ok(active);
+        }
+        if same_dir(&active.dir, &version_path) {
+            return Err("refusing to replace the running bundle".into());
+        }
+    }
 
+    on_progress(Progress::Installing);
     let stage = staging_dir()?;
-    extract_zip_secure(&zip_bytes, &stage)?;
+    extract_zip_secure(zip_bytes, &stage)?;
     if !stage.join(SERVER_ENTRY).is_file() {
         fs::remove_dir_all(&stage).ok();
-        return Err(format!("bundle v{} has no {SERVER_ENTRY}", manifest.version));
+        return Err(format!("bundle v{version} has no {SERVER_ENTRY}"));
     }
 
     if version_path.exists() {
@@ -254,16 +317,34 @@ fn install_manifest(
     }
     fs::rename(&stage, &version_path).map_err(|e| e.to_string())?;
 
-    write_active(&manifest.version, &version_path)?;
-    log::info!("OTA bundle installed: v{}", manifest.version);
+    if make_active {
+        write_active(version, &version_path)?;
+        if pending_bundle().is_some_and(|pending| pending.version == version) {
+            clear_pending();
+        }
+        log::info!("bundle installed and active: v{version}");
+    } else {
+        write_pending(version, &version_path)?;
+        log::info!("bundle downloaded, waiting for refresh: v{version}");
+    }
     Ok(Bundle {
-        version: manifest.version.clone(),
+        version: version.to_string(),
         dir: version_path,
     })
 }
 
-fn active_bundle() -> Option<Bundle> {
-    let raw = fs::read_to_string(active_pointer_path().ok()?).ok()?;
+fn install_manifest(
+    manifest: &OtaManifest,
+    make_active: bool,
+    on_progress: &dyn Fn(Progress),
+) -> Result<Bundle, String> {
+    let zip_bytes = download_bytes(&manifest.url, manifest.size, on_progress)?;
+    crypto::verify_bundle(&zip_bytes, &manifest.sha256, &manifest.signature)?;
+    install_zip(&manifest.version, &zip_bytes, make_active, on_progress)
+}
+
+fn pointer_bundle(path: Result<PathBuf, String>, label: &str) -> Option<Bundle> {
+    let raw = fs::read_to_string(path.ok()?).ok()?;
     let ptr: ActivePointer = serde_json::from_str(&raw).ok()?;
     let dir = PathBuf::from(ptr.path);
     if dir.join(SERVER_ENTRY).is_file() {
@@ -273,17 +354,219 @@ fn active_bundle() -> Option<Bundle> {
         })
     } else {
         log::warn!(
-            "cached bundle has no {SERVER_ENTRY} ({}); ignoring active pointer",
+            "{label} bundle has no {SERVER_ENTRY} ({}); ignoring pointer",
             dir.display()
         );
         None
     }
 }
 
-/// Resolve the bundle to run: install the manifest's release when it differs from the
-/// cached one, otherwise (or when offline / on failure) run the cached bundle. The very
-/// first launch has no cache and therefore needs the network.
+fn active_bundle() -> Option<Bundle> {
+    pointer_bundle(active_pointer_path(), "cached")
+}
+
+fn pending_bundle() -> Option<Bundle> {
+    pointer_bundle(pending_pointer_path(), "pending")
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a.file_name().is_some() && a.file_name() == b.file_name()
+}
+
+/// The bundle the launcher is running (or would run) right now.
+pub fn installed_bundle() -> Option<Bundle> {
+    active_bundle()
+}
+
+pub fn set_active(bundle: &Bundle) -> Result<(), String> {
+    let _guard = lock_bundles();
+    write_active(&bundle.version, &bundle.dir)
+}
+
+pub fn set_pending(bundle: &Bundle) -> Result<(), String> {
+    let _guard = lock_bundles();
+    write_pending(&bundle.version, &bundle.dir)
+}
+
+fn pending_newer_than(version: &str) -> Option<String> {
+    pending_bundle()
+        .filter(|pending| version_lt(version, &pending.version))
+        .map(|pending| pending.version)
+}
+
+/// True when `candidate` is newer than both the running bundle and any pending download.
+fn should_install(running_version: &str, candidate: &str) -> bool {
+    let floor = pending_newer_than(running_version).unwrap_or_else(|| running_version.to_string());
+    version_lt(&floor, candidate)
+}
+
+fn find_seed_dir(resource_dir: &Path) -> Option<PathBuf> {
+    let candidates = [
+        resource_dir.join("resources").join("seed-bundle"),
+        resource_dir.join("seed-bundle"),
+    ];
+    candidates
+        .into_iter()
+        .find(|dir| dir.join("version").is_file() && dir.join("bundle.zip").is_file())
+}
+
+fn seed_version(resource_dir: &Path) -> Option<String> {
+    let dir = find_seed_dir(resource_dir)?;
+    let raw = fs::read_to_string(dir.join("version")).ok()?;
+    let version = raw.trim();
+    validate_version(version).ok()?;
+    Some(version.to_string())
+}
+
+fn install_seed(
+    resource_dir: &Path,
+    make_active: bool,
+    on_progress: &dyn Fn(Progress),
+) -> Result<Option<Bundle>, String> {
+    let Some(dir) = find_seed_dir(resource_dir) else {
+        return Ok(None);
+    };
+    let version = seed_version(resource_dir)
+        .ok_or_else(|| "shipped bundle has an invalid version".to_string())?;
+    on_progress(Progress::Preparing {
+        version: version.clone(),
+    });
+    let zip_bytes =
+        fs::read(dir.join("bundle.zip")).map_err(|e| format!("read shipped bundle: {e}"))?;
+    install_zip(&version, &zip_bytes, make_active, on_progress).map(Some)
+}
+
+/// Bundle to launch before any network check: the installed copy, or the one shipped
+/// inside the app on first launch.
+pub fn startup_bundle(
+    resource_dir: Option<&Path>,
+    on_progress: &dyn Fn(Progress),
+) -> Result<Bundle, String> {
+    let _guard = lock_bundles();
+    if let Some(active) = active_bundle() {
+        log::info!("launching installed bundle v{}", active.version);
+        return Ok(active);
+    }
+    if let Some(resource_dir) = resource_dir {
+        match install_seed(resource_dir, true, on_progress) {
+            Ok(Some(bundle)) => {
+                log::info!("launching shipped bundle v{}", bundle.version);
+                return Ok(bundle);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                log::warn!("shipped bundle could not be installed: {err}");
+                return Err(err);
+            }
+        }
+    }
+    Err("no __APP_NAME__ engine installed".into())
+}
+
+/// Download a newer bundle without switching to it. Calls `on_ready` when a pending
+/// version is waiting (including one downloaded on a previous launch).
+pub fn prepare_update(
+    app_version: &str,
+    resource_dir: Option<&Path>,
+    on_ready: &dyn Fn(&str),
+) -> Result<(), String> {
+    let Some(running) = active_bundle() else {
+        return Err("no running bundle".into());
+    };
+
+    let mut announced = String::new();
+    let announce = |announced: &mut String, version: &str| {
+        if announced == version {
+            return;
+        }
+        *announced = version.to_string();
+        log::info!("update ready: v{version}");
+        on_ready(version);
+    };
+
+    if let Some(version) = pending_newer_than(&running.version) {
+        announce(&mut announced, &version);
+    }
+
+    if let Some(resource_dir) = resource_dir {
+        if let Some(version) = seed_version(resource_dir) {
+            if should_install(&running.version, &version) {
+                let guard = lock_bundles();
+                let live = active_bundle()
+                    .map(|bundle| bundle.version)
+                    .unwrap_or_else(|| running.version.clone());
+                if should_install(&live, &version) {
+                    install_seed(resource_dir, false, &|_| {})?;
+                }
+                drop(guard);
+            }
+        }
+    }
+    let running_version = active_bundle()
+        .map(|bundle| bundle.version)
+        .unwrap_or_else(|| running.version.clone());
+    if let Some(version) = pending_newer_than(&running_version) {
+        announce(&mut announced, &version);
+    }
+
+    let manifest = match fetch_manifest() {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            log::warn!("update check failed: {err}");
+            return Ok(());
+        }
+    };
+    if let Some(min) = manifest.min_app_version.as_deref() {
+        if version_lt(app_version, min) {
+            log::warn!(
+                "bundle v{} needs __APP_NAME__ {min} or newer (this is {app_version})",
+                manifest.version
+            );
+            return Ok(());
+        }
+    }
+    let running_version = active_bundle()
+        .map(|bundle| bundle.version)
+        .unwrap_or_else(|| running.version.clone());
+    if should_install(&running_version, &manifest.version) {
+        log::info!("downloading __APP_NAME__ {}", manifest.version);
+        let zip_bytes = download_bytes(&manifest.url, manifest.size, &|_| {})?;
+        crypto::verify_bundle(&zip_bytes, &manifest.sha256, &manifest.signature)?;
+        let _guard = lock_bundles();
+        let live = active_bundle()
+            .map(|bundle| bundle.version)
+            .unwrap_or(running_version);
+        if should_install(&live, &manifest.version) {
+            install_zip(&manifest.version, &zip_bytes, false, &|_| {})?;
+        }
+    } else {
+        log::info!("no newer bundle than v{running_version}");
+    }
+    if let Some(active) = active_bundle() {
+        if let Some(version) = pending_newer_than(&active.version) {
+            announce(&mut announced, &version);
+        }
+    }
+    Ok(())
+}
+
+/// Make the pending download the bundle that runs. Caller restarts the server.
+pub fn activate_pending() -> Result<Bundle, String> {
+    let _guard = lock_bundles();
+    let pending = pending_bundle().ok_or_else(|| "No update is ready to refresh.".to_string())?;
+    if active_bundle().is_some_and(|active| !version_lt(&active.version, &pending.version)) {
+        return Err("No update is ready to refresh.".into());
+    }
+    write_active(&pending.version, &pending.dir)?;
+    clear_pending();
+    log::info!("activating downloaded bundle v{}", pending.version);
+    Ok(pending)
+}
+
+/// Last-resort first launch when nothing is installed and the app shipped no seed.
+/// Downloads and activates before returning.
 pub fn ensure_bundle(app_version: &str, on_progress: &dyn Fn(Progress)) -> Result<Bundle, String> {
+    let _guard = lock_bundles();
     on_progress(Progress::Checking);
     let active = active_bundle();
 
@@ -299,14 +582,17 @@ pub fn ensure_bundle(app_version: &str, on_progress: &dyn Fn(Progress)) -> Resul
                 ));
             }
         }
-        install_manifest(&manifest, on_progress).map(Some)
+        install_manifest(&manifest, true, on_progress).map(Some)
     });
 
     match (update, active) {
         (Ok(Some(bundle)), _) => Ok(bundle),
         (Ok(None), Some(active)) => Ok(active),
         (Err(err), Some(active)) => {
-            log::warn!("OTA update skipped, running cached v{}: {err}", active.version);
+            log::warn!(
+                "OTA update skipped, running cached v{}: {err}",
+                active.version
+            );
             Ok(active)
         }
         (Err(err), None) => Err(format!("Couldn't download the __APP_NAME__ engine: {err}")),
@@ -314,16 +600,24 @@ pub fn ensure_bundle(app_version: &str, on_progress: &dyn Fn(Progress)) -> Resul
     }
 }
 
-/// Remove every installed bundle except `keep` (old versions, interrupted staging).
-pub fn prune_inactive(keep: &Bundle) {
+fn prune_except_locked(keep: &Bundle) {
     let Ok(root) = bundles_root() else { return };
-    let Ok(entries) = fs::read_dir(&root) else { return };
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    let pending = pending_bundle();
     for entry in entries.flatten() {
         let path = entry.path();
-        let name = entry.file_name();
-        if Some(name.as_os_str()) == keep.dir.file_name() {
+        if same_dir(&path, &keep.dir) {
             continue;
         }
+        if pending
+            .as_ref()
+            .is_some_and(|pending| same_dir(&path, &pending.dir))
+        {
+            continue;
+        }
+        let name = entry.file_name();
         let name = name.to_string_lossy();
         let is_bundle_dir = name.starts_with('v') || name == "staging";
         if is_bundle_dir && path.is_dir() {
@@ -335,12 +629,42 @@ pub fn prune_inactive(keep: &Bundle) {
     }
 }
 
+/// Remove every installed bundle except `keep` and a pending update.
+pub fn prune_inactive(keep: &Bundle) {
+    let _guard = lock_bundles();
+    prune_except_locked(keep);
+}
+
+#[tauri::command]
+pub fn pending_update() -> Option<String> {
+    let running = active_bundle()?;
+    pending_newer_than(&running.version)
+}
+
 #[tauri::command]
 pub fn ota_status() -> Result<serde_json::Value, String> {
     let active = active_bundle();
+    let pending = active
+        .as_ref()
+        .and_then(|active| pending_newer_than(&active.version));
     Ok(serde_json::json!({
         "manifestUrl": MANIFEST_URL,
         "activeVersion": active.as_ref().map(|b| b.version.clone()),
         "activePath": active.as_ref().map(|b| b.dir.display().to_string()),
+        "pendingVersion": pending,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_lt;
+
+    #[test]
+    fn orders_dotted_versions() {
+        assert!(version_lt("1.0.0", "1.0.1"));
+        assert!(version_lt("1.2", "1.10"));
+        assert!(!version_lt("1.0.0", "1.0.0"));
+        assert!(!version_lt("2.0.0", "1.9.9"));
+        assert!(version_lt("1.0.0-beta", "1.0.1"));
+    }
 }

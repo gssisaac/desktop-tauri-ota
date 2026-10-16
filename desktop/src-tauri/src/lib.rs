@@ -33,8 +33,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             bundle_manager::ota_status,
+            bundle_manager::pending_update,
             startup::launcher_status,
             startup::launcher_retry,
+            startup::apply_pending_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building __APP_NAME__")

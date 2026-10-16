@@ -8,7 +8,7 @@ Instructions for scaffolding a **macOS/Windows desktop app** where Tauri is a th
 - Next.js app with API routes and optional native modules (e.g. `better-sqlite3`)
 - Distribution via **Cloudflare R2** (`bundles.__APP_DOMAIN__`)
 
-Not for: embedding the entire Next app inside the Tauri binary (see legacy sidecar-only patterns).
+The installer ships the current bundle as a resource so the first launch works offline. Later versions still arrive as signed OTA zips; the running copy stays up until the user refreshes.
 
 ## Target repo layout
 
@@ -78,10 +78,18 @@ The launcher filters on `app === "__APP_SLUG__"` and waits for matching `bundleV
 
 1. **First time:** provision R2 + signing — [`docs/OTA_DEPLOYMENT.md`](docs/OTA_DEPLOYMENT.md).
 2. `pnpm release:ota 1.0.0` — builds `app/`, smoke-tests on bundled Node 22, signs, uploads `bundles/{slug}-{version}.zip` + `manifest.json`.
-3. `pnpm release:desktop` — signed notarized DMG (macOS, ≤ ~70 MB launcher budget).
-4. `pnpm release:desktop:windows` — NSIS on Windows x64 (optional signing later).
+3. `pnpm release:desktop` — signed notarized DMG. `desktop` prebuild seeds that bundle into the installer (`resources/seed-bundle/`, version file + zip). Sanity cap is 400 MB.
+4. `pnpm release:desktop:windows` — NSIS on Windows x64, same seed (optional signing later).
 
-Publish **OTA before** shipping a new launcher that depends on a new `minAppVersion`.
+`pnpm release:ota <version> --seed-only` writes the installer seed without uploading. Set `{__APP_SLUG_UPPER___BUNDLE_VERSION}` to pin the seeded version; otherwise the staged OTA manifest or `app/package.json` version is used.
+
+Publish an OTA when installed apps should pick up a newer bundle without a new installer. A DMG or NSIS build already contains the current bundle.
+
+## In-app update notice
+
+After the window is open the launcher downloads a newer bundle in the background and emits `__APP_SLUG__://update-ready`. It does not switch until the user refreshes.
+
+Copy [`desktop/updater/UpdateReadyNotice.tsx`](desktop/updater/UpdateReadyNotice.tsx) into the Next.js app shell and mount it once. It calls `pending_update` on load and `apply_pending_update` from the Refresh button. The capability already allows `http://127.0.0.1:__APP_PORT_PROD__`. Add `@tauri-apps/api` to the app.
 
 ## Customization order
 
@@ -99,6 +107,7 @@ Publish **OTA before** shipping a new launcher that depends on a new `minAppVers
 - **Invalid JS until replace:** Do not run release scripts until `__APP_*__` tokens are replaced.
 - **Rust crate names:** Use `reola_desktop`, not `reola-desktop`.
 - **Windows vs macOS OTA:** Separate manifests (`manifest.json` vs `manifest-windows-x64.json`) and signing keys.
+- **Nested seed zip:** Notarization unpacks `resources/seed-bundle/bundle.zip`. `release-ota` Developer ID-signs `.node`, `.dylib`, and `spawn-helper` before zipping when a signing identity is available.
 
 ## Verify
 

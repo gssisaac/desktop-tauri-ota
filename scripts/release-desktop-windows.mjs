@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 /**
- * Windows desktop launcher release: build the NSIS installer (launcher + bundled node.exe),
- * enforce the 70 MB size budget, and publish it to Cloudflare R2 under downloads/ plus
+ * Windows desktop launcher release: build the NSIS installer (launcher, bundled node.exe, and
+ * the current app bundle) and publish it to Cloudflare R2 under downloads/ plus
  * downloads/latest-windows.json (read by __APP_DOMAIN__/download and /download/windows).
+ *
+ * The app bundle is staged by `desktop`'s prebuild (`scripts/stage-seed-bundle.mjs`).
  *
  * Usage: pnpm release:desktop:windows [--dry-run]   (on Windows x64)
  * The installer is not Authenticode-signed yet (`notarized: false`), so the download page shows
@@ -21,13 +23,14 @@ import {
   prepareNodeSidecar,
 } from './prepare-node-sidecar.mjs';
 import { pnpmSpawn } from './pnpm.mjs';
+import { findBundledSeedVersion } from './stage-seed-bundle.mjs';
 import { r2BaseUrl, r2Put } from './r2.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const dryRun = process.argv.includes('--dry-run');
 
-/** Same budget as the DMG: the installer is only the launcher plus its Node.js runtime. */
-const MAX_INSTALLER_BYTES = 70_000_000;
+/** Launcher + Node + the zipped app bundle. The old 70 MB cap was launcher-only. */
+const MAX_INSTALLER_BYTES = 400_000_000;
 
 const desktopRoot = join(root, 'desktop');
 const tauriConf = JSON.parse(
@@ -66,6 +69,18 @@ const build = spawnSync(...pnpmSpawn(['--dir', desktopRoot, 'run', 'build']), {
 if (build.status !== 0) fail('tauri build failed');
 if (!existsSync(installerPath)) fail(`expected ${installerPath}`);
 
+const seeded = findBundledSeedVersion([
+  releaseDir,
+  join(releaseDir, 'resources'),
+  join(releaseDir, 'bundle'),
+]);
+if (!seeded) {
+  fail('installer is missing the seeded app bundle (resources/seed-bundle/version + bundle.zip)');
+}
+console.log(
+  `[release-desktop-windows] installer includes app bundle v${seeded.version} (${(statSync(seeded.zip).size / 1_048_576).toFixed(1)} MB)`,
+);
+
 // 2. Size budget.
 const size = statSync(installerPath).size;
 console.log(`[release-desktop-windows] ${installerName}: ${(size / 1_000_000).toFixed(2)} MB`);
@@ -95,6 +110,7 @@ const latest = {
   size,
   sha256,
   notarized: false,
+  bundleVersion: seeded.version,
   releaseDate: new Date().toISOString(),
 };
 

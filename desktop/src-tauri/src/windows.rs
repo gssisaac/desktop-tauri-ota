@@ -10,6 +10,16 @@ pub fn focus_main_window(app: &AppHandle) {
     }
 }
 
+/// Reload the page that is already open so a freshly started bundle replaces it.
+pub fn reload_main_window(app: &AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .ok_or("main window is not open")?;
+    window
+        .eval("window.location.reload()")
+        .map_err(|e| format!("reload main window: {e}"))
+}
+
 pub fn navigate_main_window(app: &AppHandle, url: tauri::Url) -> Result<(), String> {
     let window = app
         .get_webview_window(MAIN_WINDOW_LABEL)

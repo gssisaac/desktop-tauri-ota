@@ -1,6 +1,6 @@
 # mac-app-tauri — Thin launcher + full-stack OTA
 
-Production pattern from TablePad: the **desktop binary is only a launcher** (Tauri + bundled Node.js 22). The real app (Next.js standalone server: UI + API) ships as **Ed25519-signed OTA zips** on Cloudflare R2.
+Production pattern from TablePad: the **desktop binary is a launcher** (Tauri + bundled Node.js 22) that also ships the current app bundle inside the DMG or NSIS installer. Later versions still arrive as **Ed25519-signed OTA zips** on Cloudflare R2. The installed copy opens first; a downloaded update waits for Refresh.
 
 ## What you get
 

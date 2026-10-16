@@ -7,7 +7,7 @@
   "scripts": {
     "predev": "node ../scripts/prepare-node-sidecar.mjs",
     "dev": "tauri dev",
-    "prebuild": "node ../scripts/prepare-node-sidecar.mjs",
+    "prebuild": "node ../scripts/prepare-node-sidecar.mjs && node ../scripts/stage-seed-bundle.mjs",
     "build": "tauri build",
     "tauri": "tauri"
   },

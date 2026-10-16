@@ -20,6 +20,7 @@
     "active": true,
     "targets": ["dmg", "app"],
     "externalBin": ["binaries/node"],
+    "resources": ["resources/seed-bundle/"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

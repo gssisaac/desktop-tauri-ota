@@ -10,7 +10,8 @@ Neutral guide for **full-stack OTA bundles** and **thin desktop launcher** relea
 ├─────────────────────────────┼──────────────────────────────────────┤
 │ Tauri + splash UI           │ Next.js standalone (server.js)       │
 │ Bundled Node 22 sidecar     │ UI + /api/* on 127.0.0.1:{prod port} │
-│ ~≤ 70 MB installer budget   │ Ed25519 + SHA-256 verified on install│
+│ Current bundle seeded in    │ Ed25519 + SHA-256 verified on install│
+│ the DMG / NSIS installer    │                                       │
 └─────────────────────────────┴──────────────────────────────────────┘
 ```
 
@@ -93,11 +94,12 @@ pnpm release:desktop:windows          # Windows x64 NSIS (run on Windows)
 
 ## Client behavior (launcher)
 
-1. Fetch `manifest.json` (or Windows variant).
-2. If version ≠ installed bundle and launcher ≥ `minAppVersion`, download zip with progress UI.
-3. Verify SHA-256 + Ed25519; extract to app data dir `…/__APP_IDENTIFIER__/bundles/v{version}/`.
-4. Run bundled Node on `server.js`; navigate webview to `http://127.0.0.1:__APP_PORT_PROD__/`.
-5. Offline: use cached bundle; **first launch requires network**.
+1. Launch the installed bundle under Application Support. On first launch, unpack the bundle shipped inside the DMG or NSIS installer (`resources/seed-bundle/version`).
+2. Open that version immediately. A download does not block startup unless nothing local exists.
+3. After the window is up, fetch `manifest.json` (or the Windows variant). If it is newer and the launcher meets `minAppVersion`, download and verify in the background.
+4. Leave the new files pending. The running server stays on the current version.
+5. The app shows a bottom-left notice with Refresh (`desktop/updater/UpdateReadyNotice.tsx`). Refresh restarts onto the pending version.
+6. Offline: keep running the installed or shipped bundle.
 
 ## Checklist
 

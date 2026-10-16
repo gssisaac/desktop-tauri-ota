@@ -1,13 +1,14 @@
 //! Release boot sequence. The main window first shows the bundled launcher page
 //! (`desktop/launcher`), which renders the status published here, then navigates to the
-//! full-stack server once it is healthy.
+//! full-stack server once the already installed bundle is healthy. A newer bundle downloads
+//! in the background and stays pending until the user refreshes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::bundle_manager::{self, Progress};
 use crate::{api_bridge, windows};
@@ -94,6 +95,13 @@ fn publish_progress(handle: &AppHandle, progress: Progress) {
                 .map(|t| (received as f64 / t as f64).min(1.0));
             publish(handle, Phase::Downloading, message, fraction, None);
         }
+        Progress::Preparing { version } => publish(
+            handle,
+            Phase::Installing,
+            format!("Preparing __APP_NAME__ {version}…"),
+            None,
+            None,
+        ),
         Progress::Installing => publish(
             handle,
             Phase::Installing,
@@ -104,10 +112,54 @@ fn publish_progress(handle: &AppHandle, progress: Progress) {
     }
 }
 
+const UPDATE_READY_EVENT: &str = "__APP_SLUG__://update-ready";
+
+#[derive(Clone, Serialize)]
+struct UpdateReady {
+    version: String,
+}
+
+fn emit_update_ready(handle: &AppHandle, version: &str) {
+    let _ = handle.emit(
+        UPDATE_READY_EVENT,
+        UpdateReady {
+            version: version.to_string(),
+        },
+    );
+}
+
+fn resource_dir(handle: &AppHandle) -> Option<std::path::PathBuf> {
+    match handle.path().resource_dir() {
+        Ok(dir) => {
+            log::info!("resource dir: {}", dir.display());
+            Some(dir)
+        }
+        Err(err) => {
+            log::warn!("resource dir unavailable: {err}");
+            None
+        }
+    }
+}
+
 fn boot(handle: &AppHandle) -> Result<(), String> {
     let app_version = handle.package_info().version.to_string();
-    let bundle =
-        bundle_manager::ensure_bundle(&app_version, &|progress| publish_progress(handle, progress))?;
+    let resources = resource_dir(handle);
+    let on_progress = |progress| publish_progress(handle, progress);
+
+    publish(
+        handle,
+        Phase::Starting,
+        "Starting __APP_NAME__…".into(),
+        None,
+        None,
+    );
+    let bundle = match bundle_manager::startup_bundle(resources.as_deref(), &on_progress) {
+        Ok(bundle) => bundle,
+        Err(err) => {
+            log::warn!("no local bundle ({err}); downloading before launch");
+            bundle_manager::ensure_bundle(&app_version, &on_progress)?
+        }
+    };
 
     publish(
         handle,
@@ -132,17 +184,29 @@ pub fn spawn_boot(handle: AppHandle) {
         return;
     }
     thread::spawn(move || {
-        if let Err(err) = boot(&handle) {
+        let started = boot(&handle);
+        if let Err(err) = &started {
             log::error!("startup failed: {err}");
             publish(
                 &handle,
                 Phase::Error,
                 "__APP_NAME__ couldn't start".into(),
                 None,
-                Some(err),
+                Some(err.clone()),
             );
         }
         BOOTING.store(false, Ordering::SeqCst);
+        if started.is_ok() {
+            let app_version = handle.package_info().version.to_string();
+            let resources = resource_dir(&handle);
+            if let Err(err) =
+                bundle_manager::prepare_update(&app_version, resources.as_deref(), &|version| {
+                    emit_update_ready(&handle, version);
+                })
+            {
+                log::warn!("background update failed: {err}");
+            }
+        }
     });
 }
 
@@ -154,4 +218,36 @@ pub fn launcher_status() -> LauncherStatus {
 #[tauri::command]
 pub fn launcher_retry(app: AppHandle) {
     spawn_boot(app);
+}
+
+/// Restart onto the bundle downloaded in the background, then reload the window.
+#[tauri::command]
+pub fn apply_pending_update(app: AppHandle) -> Result<(), String> {
+    if BOOTING.swap(true, Ordering::SeqCst) {
+        return Err("__APP_NAME__ is busy. Try again in a moment.".into());
+    }
+    let result = (|| {
+        let previous = bundle_manager::installed_bundle();
+        let bundle = bundle_manager::activate_pending()?;
+        match api_bridge::start(&bundle) {
+            Ok(()) => {
+                bundle_manager::prune_inactive(&bundle);
+                windows::reload_main_window(&app)
+            }
+            Err(err) => {
+                if let Some(prev) = previous.as_ref() {
+                    let _ = bundle_manager::set_pending(&bundle);
+                    if bundle_manager::set_active(prev).is_ok() && api_bridge::start(prev).is_ok() {
+                        return Err(format!(
+                            "{err}\n\n__APP_NAME__ {} is still running.",
+                            prev.version
+                        ));
+                    }
+                }
+                Err(err)
+            }
+        }
+    })();
+    BOOTING.store(false, Ordering::SeqCst);
+    result
 }
